@@ -1,0 +1,116 @@
+name: TurnPoint Daily Ingest
+
+on:
+  schedule:
+    # 4 cron fallbacks across the morning. GH cron drifts ~15 min; this gives us
+    # multiple shots at picking up ST emails that land between 6am-1pm ET.
+    # 10:30 UTC ~= 6:30 AM EDT (5:30 EST) - primary run after ST 6am send.
+    - cron: '30 10 * * *'
+    # 11:30 UTC ~= 7:30 AM EDT - first fallback.
+    - cron: '30 11 * * *'
+    # 13:30 UTC ~= 9:30 AM EDT - mid-morning catch-up.
+    - cron: '30 13 * * *'
+    # 17:30 UTC ~= 1:30 PM EDT - afternoon safety net.
+    - cron: '30 17 * * *'
+  workflow_dispatch:
+    inputs:
+      lookback_hours:
+        description: 'Gmail lookback (hours)'
+        required: false
+        default: '72'
+        type: string
+      force_reembed:
+        description: 'Force re-embed even if no new emails / today already pushed'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false','true']
+      tenant_subset:
+        description: 'Comma-separated tenant_ids (empty = all 51)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write          # commit + push to main
+
+env:
+  PIPELINE_STATE_TAG: bootstrap-v1   # GitHub release tag holding turnpoint_bootstrap.tar.gz
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60        # 51 tenants x ~20s each = ~17 min + Gmail/clone/push + slack
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 30
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Python deps
+        run: pip install --quiet openpyxl
+
+      - name: Restore pipeline state (tenants/) from cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: tenants
+          # Date-keyed so each successful run mints a new cache entry; restore-keys
+          # fall back to the most recent prior cache so partial-day re-runs reuse state.
+          key: tp-tenants-${{ github.run_id }}
+          restore-keys: |
+            tp-tenants-
+
+      - name: Bootstrap pipeline state (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          echo "Cache miss - downloading turnpoint_bootstrap from release ${PIPELINE_STATE_TAG}"
+          curl -sL \
+            -H "Authorization: token ${{ secrets.BOOTSTRAP_DOWNLOAD_TOKEN || secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${PIPELINE_STATE_TAG}" \
+            | python3 -c "import sys,json; r=json.load(sys.stdin); a=[x for x in r['assets'] if x['name'].endswith('.tar.gz')][0]; print(a['url'])" \
+            | xargs -I{} curl -sL -H "Authorization: token ${{ secrets.BOOTSTRAP_DOWNLOAD_TOKEN || secrets.GITHUB_TOKEN }}" -H "Accept: application/octet-stream" -o turnpoint_bootstrap.tar.gz "{}"
+          ls -la turnpoint_bootstrap.tar.gz
+          tar xzf turnpoint_bootstrap.tar.gz
+          rm turnpoint_bootstrap.tar.gz
+          echo "Bootstrap restored. tenants/ count:"
+          ls tenants/ | wc -l
+          echo "pipeline/ scripts:"
+          ls pipeline/ | head -10
+          echo "registry tenants:"
+          python3 -c "import json; print(len(json.load(open('run/TENANT_REGISTRY.json'))))"
+
+      - name: Run daily ingest (all 51 tenants)
+        env:
+          GMAIL_OAUTH_CLIENT_ID:     ${{ secrets.GMAIL_OAUTH_CLIENT_ID }}
+          GMAIL_OAUTH_CLIENT_SECRET: ${{ secrets.GMAIL_OAUTH_CLIENT_SECRET }}
+          GMAIL_OAUTH_REFRESH_TOKEN: ${{ secrets.GMAIL_OAUTH_REFRESH_TOKEN }}
+          GITHUB_TOKEN_FOR_PUSH:     ${{ secrets.GITHUB_TOKEN }}
+          WORK_DIR:                  ${{ github.workspace }}
+          REPO_DIR:                  ${{ github.workspace }}/_repo_clone
+          PIPE_DIR:                  ${{ github.workspace }}/pipeline
+          TP_V2_ROOT:                ${{ github.workspace }}
+          GMAIL_LOOKBACK_HOURS:      ${{ github.event.inputs.lookback_hours || '72' }}
+          FORCE_REEMBED:             ${{ github.event.inputs.force_reembed || 'false' }}
+          TENANT_SUBSET:             ${{ github.event.inputs.tenant_subset || '' }}
+          TURNPOINT_REPO_URL:        https://github.com/${{ github.repository }}.git
+        run: |
+          python3 pipeline/daily_ingest_multitenant.py
+        # Exit codes: 0=ok/no-op, 2=no email (clean skip), 3=tenant-level fail (non-fatal),
+        # 5=push fail, 6=stale data, 1=other.
+        continue-on-error: false
+
+      # Cache is saved automatically by actions/cache@v4 on successful job completion.
